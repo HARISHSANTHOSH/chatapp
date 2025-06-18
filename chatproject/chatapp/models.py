@@ -95,8 +95,17 @@ class UserSubscription(models.Model):
         models.DateTimeField()
     )  # End of the current billing cycle
     status = models.CharField(
-        max_length=50, default="active"
-    )  # Active, Pending, Cancelled, etc.
+        max_length=50,
+        choices=[
+            ("active", "Active"),
+            (
+                "inactive",
+                "Inactive",
+            ),  # When the user downgrades or the plan becomes inactive
+            ("cancelled", "Cancelled"),
+        ],
+        default="active",
+    )  #
 
     created_at = models.DateTimeField(
         auto_now_add=True

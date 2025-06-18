@@ -1,7 +1,7 @@
 import json
 import logging
 import uuid
-
+from rest_framework import permissions
 import stripe
 from django.conf import settings
 from django.http import JsonResponse
@@ -177,3 +177,100 @@ class ChatThread(APIView):
             return response.Response(
                 {"result": True, "msg": "good", "data": chat_thread}
             )
+        
+def payment_page(request):
+    return render(request, 'payment.html', {
+        'STRIPE_PUBLIC_KEY': settings.STRIPE_PUBLISHABLE_KEY
+    })
+def poster_render(request):
+    return render(request,"poster.html")
+
+@method_decorator(csrf_exempt, name='dispatch')
+class CreateCheckoutSessionView(APIView):
+    permission_classes = (permissions.AllowAny,)
+    def post(self, request, *args, **kwargs):
+        plan_id = request.data.get('plan_id')
+
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+
+        PRICE_IDS = {
+            'standard': constants.PricePlans.STANDARD,
+            'premium': constants.PricePlans.PREMIUM,  
+            'basic': constants.PricePlans.BASIC,  
+        }
+
+        if plan_id not in PRICE_IDS:
+            return response.Response(
+                {"result": False, "message": "Invalid plan ID."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+
+            order_reference = str(uuid.uuid4())
+            checkout_session = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price': PRICE_IDS[plan_id],
+                    'quantity': 1,
+                }],
+                mode='subscription',
+                success_url=request.build_absolute_uri('http://127.0.0.1:8000/api/v1/chatapp/poster/'),
+                cancel_url=request.build_absolute_uri('/cancel/'),
+                client_reference_id=order_reference,
+                metadata={"payment_type": "subscription","plan_id": plan_id}
+            )
+
+            return response.Response(
+                {"result": True, "sessionId": checkout_session.id, "orderReference": order_reference},
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return response.Response(
+                {"result": False, "message": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class StripeWebhookView(APIView):
+    permission_classes = (permissions.AllowAny,)
+    def post(self, request, *args, **kwargs):
+        try:
+            payload = request.body
+            sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
+            
+            if not sig_header:
+                logger.error("No Stripe signature found in request headers")
+                return JsonResponse({'error': 'No signature header'}, status=400)
+
+            cli_secret = settings.STRIPE_CLI_SECRET
+            webhook_secret = settings.STRIPE_WEBHOOK_SECRET
+            
+            # Verify the webhook
+            event = StripeWebhookHandler.verify_webhook(payload, sig_header, cli_secret, webhook_secret)
+            if isinstance(event, JsonResponse):
+                return event
+
+            # Handle different events based on event type
+            event_type = event['type']
+            metadata = event['data']['object'].get('metadata', {})
+
+            # Check payment type to handle events separately
+            payment_type = metadata.get('payment_type', 'unknown')
+
+            # Handle subscription event (checkout.session.completed)
+            if event_type == 'checkout.session.completed' and payment_type == 'subscription':
+                return StripeWebhookHandler.handle_checkout_session(event)
+
+            # Handle one-time payment event (payment_intent.succeeded)
+            elif event_type == 'checkout.session.completed' and payment_type == 'one_time':
+                return StripeWebhookHandler.handle_payment_intent(event)
+
+            return JsonResponse({'status': 'Event not handled'}, status=200)
+
+        except Exception as e:
+            logger.error(f"Webhook error: {str(e)}", exc_info=True)
+            return JsonResponse({'error': str(e)}, status=500)

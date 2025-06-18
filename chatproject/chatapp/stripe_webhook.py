@@ -1,230 +1,196 @@
-import logging
+from dataclasses import dataclass
 from datetime import datetime
-
-import stripe
+from chatapp import models
+from django.db import transaction
 from dateutil.relativedelta import relativedelta
-from django.conf import settings
-from django.http import JsonResponse
+from rest_framework import permissions, response, status
 from django.utils import timezone
-from django.utils.decorators import method_decorator
 from django.utils.timezone import make_aware
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework import response, status
-from rest_framework.response import Response
+import stripe
+from typing import Optional
 
-from chatapp import send_mail
+@dataclass
+class CustomerInfo:
+    email: str
+    name: str
 
-from . import models
-from .exceptions import CustomException
+@dataclass
+class PaymentInfo:
+    amount: float
+    currency: str
+    status: str
+    payment_intent_id: str
+    payment_date: datetime
 
-logger = logging.getLogger(__name__)
+@dataclass
+class SubscriptionInfo:
+    plan_id: str
+    order_reference: str
+    start_date: datetime
+    current_period_end: datetime
 
+class StripeSessionProcessor:
+    def __init__(self, event):
+        self.session = event["data"]["object"]
+        self.now = timezone.now()
+
+    def extract_customer_info(self) -> CustomerInfo:
+        """Extract customer details from the session."""
+        customer_details = self.session.get("customer_details", {})
+        return CustomerInfo(
+            email=customer_details.get("email", ""),
+            name=customer_details.get("name", "")
+        )
+
+    def extract_payment_info(self) -> PaymentInfo:
+        """Extract payment related information."""
+        # Get subscription and invoice details
+        subscription_id = self.session.get("subscription")
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        latest_invoice_id = subscription.latest_invoice
+        invoice = stripe.Invoice.retrieve(latest_invoice_id)
+        payment_intent_id = invoice.payment_intent
+
+        # Get payment details
+        timestamp = self.session.get("created")
+        payment_date = make_aware(datetime.fromtimestamp(timestamp)) if timestamp else self.now
+
+        return PaymentInfo(
+            amount=self.session.get("amount_total", 0) / 100,  # Convert cents to dollars
+            currency=self.session.get("currency", "usd"),
+            status=self.session["payment_status"],
+            payment_intent_id=payment_intent_id,
+            payment_date=payment_date
+        )
+
+    def extract_subscription_info(self) -> SubscriptionInfo:
+        """Extract subscription related information."""
+        return SubscriptionInfo(
+            plan_id=self.session["metadata"].get("plan_id", "unknown"),
+            order_reference=self.session.get("client_reference_id"),
+            start_date=self.now - relativedelta(months=1),
+            current_period_end=self.now + relativedelta(months=1)
+        )
 
 class StripeWebhookHandler:
-
     @staticmethod
     def verify_webhook(payload, sig_header, cli_secret, webhook_secret):
         """Verify the webhook using CLI and webhook secrets."""
         try:
             event = None
             try:
-                event = stripe.Webhook.construct_event(
-                    payload, sig_header, cli_secret
-                )
-                logger.info("Webhook verified with CLI secret")
+                event = stripe.Webhook.construct_event(payload, sig_header, cli_secret)
             except stripe.error.SignatureVerificationError:
                 try:
-                    event = stripe.Webhook.construct_event(
-                        payload, sig_header, webhook_secret
-                    )
-                    logger.info("Webhook verified with webhook secret")
+                    event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
                 except stripe.error.SignatureVerificationError as e:
-                    logger.error(f"Signature verification failed: {str(e)}")
-                    return JsonResponse(
-                        {"error": "Invalid signature"}, status=400
-                    )
+                    return response.Response({'error': 'Invalid signature'}, status=400)
             return event
         except Exception as e:
-            logger.error(
-                f"Webhook verification error: {str(e)}", exc_info=True
-            )
-            return JsonResponse({"error": str(e)}, status=500)
-
+            return response.Response({'error': str(e)}, status=500)
     @staticmethod
     def handle_checkout_session(event):
         """Handle the 'checkout.session.completed' event."""
         try:
-            # Extract data from the session object
-            session = event["data"]["object"]
-            plan_id = session["metadata"].get("plan_id", "unknown")
-            amount_received = (
-                session.get("amount_total", 0) / 100
-            )  # Convert cents to dollars
-            currency = session.get("currency", "usd")
-            order_reference = session.get("client_reference_id")
-            payment_status = session["payment_status"]
-            timestamp = session.get("created", None)
-            payment_date = make_aware(datetime.fromtimestamp(timestamp))
-            customer_details = session.get("customer_details", {})
-            customer_email = customer_details.get("email", "")
-            customer_name = customer_details.get("name", "")
+            # Process the session data
+            processor = StripeSessionProcessor(event)
+            customer_info = processor.extract_customer_info()
+            payment_info = processor.extract_payment_info()
+            subscription_info = processor.extract_subscription_info()
 
-            now = timezone.now()
-            start_date = now - relativedelta(months=1)
-            current_period_end = now + relativedelta(months=1)
-            subscription_id = session.get("subscription")
-            subscription = stripe.Subscription.retrieve(subscription_id)
-            latest_invoice_id = subscription.latest_invoice
-            invoice = stripe.Invoice.retrieve(latest_invoice_id)
-            payment_intent_id = invoice.payment_intent
-            logger.info("payment_intent_id:", payment_intent_id)
-
-            # Check if the order has already been processed
+            # Check for existing order
             if models.UserSubscription.objects.filter(
-                order_reference=order_reference
+                order_reference=subscription_info.order_reference
             ).exists():
-                logger.info(
-                    f"Order reference {order_reference} already exists. Skipping creation."
-                )
-                return Response(
-                    {"status": "Order already processed"},
-                    status=status.HTTP_200_OK,
-                )
-
-            # Handle subscription creation or update based on the user's email
-            user_subscription, created = (
-                models.UserSubscription.objects.update_or_create(
-                    user_email=customer_email,  # Unique identifier for the user
-                    defaults={
-                        "customer_name": customer_name,
-                        "order_reference": order_reference,
-                        "plan": plan_id,
-                        "status": payment_status,  # Status is now based on the payment status
-                        "start_date": start_date,
-                        "current_period_end": current_period_end,
-                    },
-                )
-            )
-
-            # Create a payment record in the UserPayment model
-            user_payment = models.UserPayment.objects.create(
-                user_subscription=user_subscription,
-                payment_id=payment_intent_id,
-                amount=amount_received,
-                currency=currency,
-                payment_status=payment_status,
-                payment_date=payment_date,
-            )
-
-            # Log the successful subscription/payment creation or update
-            if created:
-                logger.info(
-                    f"New subscription created for {customer_email}, Plan: {plan_id}"
-                )
-                # You can also send a confirmation email here if needed
-                send_mail.send_subscription_confirmation(user_subscription)
-            else:
-                logger.info(
-                    f"Subscription updated for {customer_email}, Plan: {plan_id}"
-                )
-                # Send an email about the successful update
-                send_mail.send_upgrade_email(user_subscription)
-
-            return Response(
-                {"status": "Subscription created/updated successfully"},
-                status=status.HTTP_200_OK,
-            )
-
-        except Exception as e:
-            # Log any errors that occur during processing
-            logger.error(
-                f"Error processing checkout session: {str(e)}", exc_info=True
-            )
-            return Response(
-                {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-    @staticmethod
-    def handle_payment_intent(event):
-        """Handle the 'payment_intent.succeeded' event for one-time custom payments."""
-        try:
-            payment_intent = event["data"]["object"]
-            print(payment_intent)
-
-            # Extract payment details
-            order_reference = payment_intent["metadata"].get("order_reference")
-            amount_received = (
-                payment_intent.get("amount_total", 0) / 100
-            )  # Convert cents to dollars
-            currency = payment_intent.get("currency", "usd")
-            payment_status = payment_intent.get("status", "unknown")
-            payment_id = payment_intent.get("payment_intent")
-            payment_date = timezone.now()
-            print("pa", payment_date)
-
-            # Get customer details if available
-            customer_details = payment_intent.get("customer_details", {})
-            user_email = customer_details.get("email")
-            customer_name = customer_details.get("name")
-
-            # Check if payment already processed
-            if models.OneTimePayment.objects.filter(
-                order_reference=order_reference
-            ).exists():
-                # Raise the custom exception for duplicate payment
                 return response.Response(
                     {"status": "Order already processed"},
                     status=status.HTTP_200_OK,
                 )
 
-            # Create payment record
-            models.OneTimePayment.objects.create(
-                order_reference=order_reference,
-                payment_id=payment_id,
-                amount=amount_received,
-                currency=currency,
-                payment_status=payment_status,
-                payment_date=payment_date,
-                user_email=user_email,
-                customer_name=customer_name,
-            )
+            with transaction.atomic():
+                # Handle subscription
+                subscription = SubscriptionManager.handle_subscription(
+                    customer_info, subscription_info
+                )
+
+                # Create payment record
+                PaymentManager.create_payment(
+                    subscription, payment_info
+                )
 
             return response.Response(
-                {
-                    "result": True,
-                    "message": "Payment processed successfully. Payment record created.",
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        except CustomException as e:
-            # Handle the custom exception (for duplicate payment)
-            return response.Response(
-                {
-                    "result": e.detail["result"],
-                    "message": e.detail["msg"],
-                },
+                {"status": "Subscription created/updated successfully"},
                 status=status.HTTP_200_OK,
             )
 
         except Exception as e:
-            # Handle database errors or other unexpected errors
-            if isinstance(e, models.OneTimePayment.DoesNotExist):
-                logger.error(f"Database error: {str(e)}")
-                raise CustomException(
-                    detail={
-                        "result": False,
-                        "msg": f"Database error occurred: {str(e)}",
-                    }
-                )
-            else:
-                # Log general unexpected errors
-                logger.error(
-                    f"Payment intent handling error: {str(e)}", exc_info=True
-                )
-                raise CustomException(
-                    detail={
-                        "result": False,
-                        "msg": f"An unexpected error occurred: {str(e)}",
-                    }
-                )
+            return response.Response(
+                {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class SubscriptionManager:
+    @staticmethod
+    def handle_subscription(customer_info: CustomerInfo, 
+                          subscription_info: SubscriptionInfo) -> models.UserSubscription:
+        """Handle subscription creation or upgrade."""
+        # Check for existing subscription
+        existing_subscription = models.UserSubscription.objects.filter(
+            user_email=customer_info.email
+        ).first()
+
+        if existing_subscription:
+            return SubscriptionManager._handle_upgrade(
+                existing_subscription, customer_info, subscription_info
+            )
+        
+        return SubscriptionManager._create_new_subscription(
+            customer_info, subscription_info
+        )
+
+    @staticmethod
+    def _handle_upgrade(existing_subscription: models.UserSubscription,
+                       customer_info: CustomerInfo,
+                       subscription_info: SubscriptionInfo) -> models.UserSubscription:
+        """Handle subscription upgrade scenario."""
+        if existing_subscription.plan != subscription_info.plan_id:
+            existing_subscription.status = "inactive"
+            existing_subscription.save()
+
+        return models.UserSubscription.objects.create(
+            user_email=customer_info.email,
+            customer_name=customer_info.name,
+            order_reference=subscription_info.order_reference,
+            plan=subscription_info.plan_id,
+            status="active",
+            start_date=subscription_info.start_date,
+            current_period_end=subscription_info.current_period_end,
+        )
+
+    @staticmethod
+    def _create_new_subscription(customer_info: CustomerInfo,
+                               subscription_info: SubscriptionInfo) -> models.UserSubscription:
+        """Create a new subscription."""
+        return models.UserSubscription.objects.create(
+            user_email=customer_info.email,
+            customer_name=customer_info.name,
+            order_reference=subscription_info.order_reference,
+            plan=subscription_info.plan_id,
+            status="active",
+            start_date=subscription_info.start_date,
+            current_period_end=subscription_info.current_period_end,
+        )
+
+
+class PaymentManager:
+    @staticmethod
+    def create_payment(subscription: models.UserSubscription, 
+                      payment_info: PaymentInfo) -> models.UserPayment:
+        """Create a payment record."""
+        return models.UserPayment.objects.create(
+            user_subscription=subscription,
+            payment_id=payment_info.payment_intent_id,
+            amount=payment_info.amount,
+            currency=payment_info.currency,
+            payment_status=payment_info.status,
+            payment_date=payment_info.payment_date,
+        )
